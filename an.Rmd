@@ -1,0 +1,277 @@
+---
+title: "Тестовое задание"
+output: html_document
+author: "Вергасова Екатерина"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+## Загружаем данные и библиотеки
+```{r, message=FALSE}
+library(pagoda2)
+library(conos)
+library(tidyverse)
+library(magrittr)
+library(igraph)
+library(Seurat)
+library(CellAnnotatoR)
+library(ggplot2)
+library(magrittr)
+library(Matrix)
+library(pbapply)
+library(dplyr)
+library(pheatmap)
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+```
+
+```{r, message=FALSE}
+data117 <-  readMM("/home/kvergasova/An/single_cell/test_task/117-A3/matrix.mtx")
+data117 <- t(data117)
+colnames(data117) <- read_tsv("/home/kvergasova/An/single_cell/test_task/117-A3/barcodes.tsv", col_names = F)$X1
+rownames(data117) <- read_tsv("/home/kvergasova/An/single_cell/test_task/117-A3/genes.tsv", col_names = F)$X1
+
+data124 <- readMM("/home/kvergasova/An/single_cell/test_task/124-A2/matrix.mtx")
+data124 <- t(data124)
+colnames(data124) <- read_tsv("/home/kvergasova/An/single_cell/test_task/124-A2/barcodes.tsv", col_names = F)$X1
+rownames(data124) <- read_tsv("/home/kvergasova/An/single_cell/test_task/124-A2/genes.tsv", col_names = F)$X1
+```
+
+Смотрим дублируются ли баркоды, для последующего анализа важно, чтобы все баркоды были уникальными. У датасетов 117 и 124 есть перекрывающиеся баркоды, добавляем к баркодам 117 "-117"
+```{r}
+any(duplicated(colnames(data124)))
+any(duplicated(colnames(data117)))
+any(duplicated(c(colnames(data117),colnames(data124))))
+colnames(data117) <- str_c(colnames(data117), "-117")
+```
+
+## QC анализ
+Изначальные размеры 117 44792 генов на 318949 ядер, для 124 50050 генов на 572737 ядер.
+```{r}
+#убираем ядра с нулевой экспрессией во всех клетках
+data117 <- data117[,colSums(data117) != 0]
+data124 <- data124[,colSums(data124) != 0]
+
+#Строим распределение подсчетов на ядро и производим фильтрацию ядер низкого качества, порог 400 подсчетов на ядро для 117 и 400 для 124
+hist(log10(colSums(data117)+1), main='molecules per cell', col='cornsilk', xlab='log10(molecules per cell)')
+data117_400 <- gene.vs.molecule.cell.filter(data117, min.cell.size=200)
+
+hist(log10(colSums(data124)+1), main='molecules per cell', col='cornsilk', xlab='log10(molecules per cell)')
+data124_400 <- gene.vs.molecule.cell.filter(data124, min.cell.size=400)
+
+#Строим распределение подсчетов на ген, находим слабо экспресируемые гены и удаляем их
+hist(log10(rowSums(data117_400)+1), main='molecules per gene', col='cornsilk', xlab='log10(molecules per gene])')
+data117_400 <- data117_400[rowSums(data117_400)>=1, ]  
+
+hist(log10(rowSums(data124_400)+1), main='molecules per gene', col='cornsilk', xlab='log10(molecules per gene])')
+data124_400 <- data124_400[rowSums(data124_400)>=2, ] 
+```
+После фильтрации: 
+```{r}
+dim(data124_400)
+dim(data117_400)
+```
+Датасет 117 очень низкого качетва, вполне возможно, что его следует исключить из дальнейшего анализа.
+
+### Предварительная обработка. 
+Создаем объект padoda2 для датасетов. Производиться нормализация размеров библиотек и корректировка дисперсии (нормализоация  влияния генов с разными величинами экспрессии). Идентифицируются сверхдисперсные гены (2000 генов).
+
+```{r, message=F, warning=FALSE}
+# конвертация матриц в необходимый формат
+
+data117_400 <- as(data117_400, "dgCMatrix")
+data124_400 <- as(data124_400, "dgCMatrix")
+
+r117 <- Pagoda2$new(data117_400,log.scale = TRUE, n.cores=4)
+r117$adjustVariance(plot=TRUE, gam.k=10)
+
+r124 <- Pagoda2$new(data124_400,log.scale = TRUE, n.cores=4)
+r124$adjustVariance(plot=TRUE, gam.k=10)
+
+# уменьшаем размеры набора данных c помощью PCA
+
+r117$calculatePcaReduction(n.odgenes=2e3) 
+r124$calculatePcaReduction(n.odgenes=2e3)
+
+# строится граф и находятся кластера
+r124$makeKnnGraph(k=40, type='PCA', center=TRUE, distance='cosine')
+r117$makeKnnGraph(k=40, type='PCA', center=TRUE, distance='cosine')
+r117$getKnnClusters(method=infomap.community, type='PCA')
+r124$getKnnClusters(method=infomap.community, type='PCA')
+
+#Нахождение вложений и кластеров
+M <- 30
+r117$getEmbedding(type='PCA', embeddingType = 'largeVis', M=M, perplexity=30, gamma=1/M, alpha=1)
+r117$getEmbedding(type='PCA', embeddingType='tSNE', perplexity=10,verbose=FALSE)
+r124$getEmbedding(type='PCA', embeddingType = 'largeVis', M=M, perplexity=30, gamma=1/M, alpha=1)
+r124$getEmbedding(type='PCA', embeddingType='tSNE', perplexity=10,verbose=FALSE)
+
+r124$getKnnClusters(method=multilevel.community, type='PCA', name='multilevel')
+r117$getKnnClusters(method=multilevel.community, type='PCA', name='multilevel')
+
+```
+
+### Объединение датасетов с помощью conos. Устранение batc-эффекта.
+```{r, message=F}
+panel <- list("r117" = r117, "r124" = r124)
+con <- Conos$new(panel, n.cores=4)
+# визуализация для каждого из датасетов
+con$plotPanel(clustering="multilevel", use.local.clusters=TRUE, title.size=6)
+# Построение объединенного графа и общего PCA 
+con$buildGraph(k=30, k.self=5, space='PCA', ncomps=30, n.odgenes=2000, matching.method='mNN', metric='angular', score.component.variance=TRUE, verbose=TRUE)
+
+# нахождение общих кластеров 
+con$findCommunities(method=leiden.community, resolution=0.5)
+con$findCommunities(method = igraph::walktrap.community, steps=7)
+
+# получаем объединенную матрицу
+mat <- t(con$getJointCountMatrix())
+
+```
+
+## Аннотация клеток с помощью cellAnnotatoR. 
+cellAnnotatoR работает на основе пакета Pagoda2, который использовался выше в анализе. Этот анотатор показывает высокую точность работы и что немаловажно, очень быстро работает. Но для его работы необходимо заранее знать какие клеточные типы должны быть определены, и какие гены им соответствуют. Для данного датасета, был создан файл kidney1.md, с предполагаемыми клеточными типами и генами. Данные были взяты из статьи (https://www.nature.com/articles/s41597-019-0351-8#Abs1).
+```{r, warning=F,message=F}
+
+marker_path1 <- "/home/kvergasova/An/single_cell/kidney1.md"
+
+marker_list <- parseMarkerFile(marker_path1)
+
+p1 <- basicP2proc(mat,n.cores=4, min.cells.per.gene = 0, n.odgenes = 2e3, 
+                  get.largevis = FALSE, make.geneknn = FALSE, get.tsne = T)
+p1$getKnnClusters(type="PCA", method=conos::leiden.community, resolution=1, n.iterations=10, name="leiden")
+
+clf_data1 <- getClassificationData(mat, marker_list, prenormalized=T)
+ann_by_level1 <- assignCellsByScores(p1$graphs$PCA, clf_data1, clusters=p1$clusters$PCA$leiden)
+plotAnnotationByLevels(p1$embeddings$PCA$tSNE, ann_by_level1$annotation, size=0.2, 
+                       font.size=c(2, 4), shuffle.colors=T)
+
+```
+
+
+```{r, warning=F}
+table(ann_by_level1$annotation)
+```
+Всего удалось выделилось 4 клеточных типа
+Больше всего glomerular parietal epithelial cell 66%
+Затем Proximal_tubule cells 25%
+Затем Monocytes 5%
+Endothelial cells 3%
+
+
+Полученные соотношения клеточных типов заметно отличаются от данных для здоровой почки из статьи (https://www.nature.com/articles/s41597-019-0351-8#Abs1):
+Proximal_convoluted_tubule cell  ~ 50%
+Proximal_tubule cells  ~ 32%
+Proximal_straight_tubule cells  ~ 5%
+NK-T cell  ~ 5%
+Monocutes  ~ 3%
+glomerular parietal epithelial cell  ~ 3%
+Distal_tubule cell  ~ 2%
+Collecting_duct_principal_cells ~ 0.7%
+B cells ~ 0.6%
+Collecting_duct_intercalated_cells ~ 0.3%
+
+
+Основное отличие проаннотированных клеток от здоровых, заключается в явном доминировании glomerular parietal epithelial cell. Процентное соотношение Proximal_tubule cells и Monocytes практически не изменилось. Так же был обнаружен клеточный тип Endothelial cells в небольшом количестве.
+
+
+
+
+## Возможные процессы и активированные клеточные пути
+
+```{r,warning=F,message=F}
+
+cellannot <-ann_by_level1$annotation$l1
+#Дифференциальная экспрессия для обнаруженных клеточных типов
+de.info <- con$getDifferentialGenes(groups=cellannot, n.cores=4, append.auc=TRUE)
+# К сожалениею для Glomerular_parietal_epithelial_cells не получилось найти дифф экспресию (из-за того что в образце 117 все клетки были отнесены к этому типу)
+de <- list(Endothelial = de.info$Endothelial, Monocytes = de.info$Monocytes, Proximal_tubule = de.info$Proximal_tubule)
+
+
+plotDEheatmap(con, as.factor(cellannot), de, n.genes.per.cluster = 5, column.metadata=list(samples=con$getDatasetPerCell()), row.label.font.size = 7, remove.duplicates=F)
+```
+
+
+```{r}
+#функции генов
+genes <- c("ANO2", "ADAP2", "ELMO1", "SAT1", "TNRC6B", "MARCH6", "SMAD2", "DAAM1", "PAN3")
+
+function.gene <- mapIds(org.Hs.eg.db,
+                     keys=genes, 
+                     column="GENENAME",
+                     keytype="SYMBOL",
+                     multiVals="first")
+function.gene
+```
+
+Попробуем произвести классический анализ путей для данных рнк секвенирования. Сведем все клетки к 4 кластерам - клеточным типам.
+```{r, warning=F,message=F}
+library(DESeq2)
+library(gage)
+library(gageData)
+
+#Кластеризация данных, расчет генов для каждого клеточного типа
+data_clusters <- conos:::collapseCellsByType(t(mat), ann_by_level1$annotation$l1, min.cell.count = 0)
+countData <- t(data_clusters)
+
+
+colData <- setNames(colnames(countData),  colnames(countData))
+colData <- tibble(condition = colnames(countData))
+rownames(colData) <- colnames(countData)
+
+countData <- round(countData*10)
+dds <- DESeqDataSetFromMatrix(countData=countData,
+                              colData=colData, design=~1)
+dds <-  DESeq(dds)
+res <- results(dds)
+res <- res[order(res$pvalue),]
+
+res$ens <- mapIds(org.Hs.eg.db,
+                     keys=row.names(res), 
+                     column="ENSEMBL",
+                     keytype="SYMBOL",
+                     multiVals="first")
+res$entrez <- mapIds(org.Hs.eg.db,
+                     keys=row.names(res), 
+                     column="ENTREZID",
+                     keytype="SYMBOL",
+                     multiVals="first")
+res$name <-  mapIds(org.Hs.eg.db,
+                     keys=row.names(res), 
+                     column="GENENAME",
+                     keytype="SYMBOL",
+                     multiVals="first")
+
+
+data(kegg.sets.hs)
+data(sigmet.idx.hs)
+kegg.sets.hs <- kegg.sets.hs[sigmet.idx.hs]
+foldchanges <- res$log2FoldChange
+names(foldchanges) <- res$entrez
+
+# Анализ путей 
+keggres <- gage(foldchanges, gsets=kegg.sets.hs, same.dir=TRUE)
+lapply(keggres, head)
+
+# Выберем 10 высходящих путей
+keggrespathways <- data.frame(id=rownames(keggres$greater), keggres$greater) %>% 
+  tbl_df() %>% 
+  filter(row_number()<=10) %>% 
+  .$id %>% 
+  as.character()
+```
+
+Возможные активированные пути:
+```{r}
+
+keggrespathways
+```
+
+
+
+
